@@ -1,4 +1,4 @@
-//! Custom widgets for the PhotoCraft look: cards with pill tabs, thin sliders with round knobs,
+//! Custom widgets for the Photo look: cards with pill tabs, thin sliders with round knobs,
 //! monospace value fields with dimmed units, toggle switches, primary/secondary buttons.
 
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
@@ -854,7 +854,7 @@ pub const TEXT_FIELD_H: f32 = 24.0;
 /// Inner padding of a [`text_field`]'s box: 6 pt either side, 2 pt above and below.
 const TEXT_FIELD_PAD: Vec2 = vec2(6.0, 2.0);
 
-/// A single-line text field in PhotoCraft's shared field style (#3789): the same box as a
+/// A single-line text field in Photo's shared field style (#3789): the same box as a
 /// [`value_field`] -- the theme's field fill and `field_border`, rounded by `radius_sm` -- with a
 /// consistent inner padding and no focus outline. egui's default white focus ring (its
 /// `selection.stroke`) is what made the Preferences search field look different from the Color
@@ -3011,7 +3011,7 @@ pub fn pick_pos(resp: &Response) -> Option<Pos2> {
         && resp.ctx.input(|i| i.pointer.primary_down() && !i.pointer.button_down(egui::PointerButton::Secondary) && !i.pointer.middle_down());
     if held || resp.clicked() { resp.interact_pointer_pos() } else { None }
 }
-/// A colour swatch that only reports clicks (no popup): for colours edited in PhotoCraft's own
+/// A colour swatch that only reports clicks (no popup): for colours edited in Photo's own
 /// Color Picker dialog. `label` names it for hover text and accessibility.
 pub fn color_swatch_button(ui: &mut Ui, color: Color32, label: &str) -> Response {
     let t = Tokens::get(ui.ctx());
