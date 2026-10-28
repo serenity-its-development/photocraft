@@ -99,6 +99,17 @@ fn pack_catalogs() {
             println!("cargo::rerun-if-changed={}", path.display());
             catalogs.push((name.to_owned(), std::fs::read_to_string(&path)?));
         }
+        // OneOS's browser build embeds the languages named in PHOTOCRAFT_LOCALES (comma-separated codes, "de,es,pt-br"); a language left out
+        // reads as English (its catalog is empty, and its keys are not indexed). Unset, every language is embedded, as before.
+        println!("cargo::rerun-if-env-changed=PHOTOCRAFT_LOCALES");
+        if let Ok(v) = std::env::var("PHOTOCRAFT_LOCALES") {
+            let only: Vec<String> = v.split(',').map(|c| c.trim().to_ascii_lowercase()).filter(|c| !c.is_empty()).collect();
+            for (name, text) in &mut catalogs {
+                if !only.contains(&name.trim_end_matches(".tsv").to_ascii_lowercase()) {
+                    text.clear();
+                }
+            }
+        }
         // Largest first, then by name: the key order (and so the output) is reproducible.
         catalogs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         let mut keys: Vec<&str> = Vec::new();

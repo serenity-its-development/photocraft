@@ -5018,6 +5018,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "photocraft-host-node"
+version = "0.15.1"
+dependencies = [
+ "photocraft-engine",
+ "photocraft-paint",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "photocraft-io"
 version = "0.15.1"
 dependencies = [

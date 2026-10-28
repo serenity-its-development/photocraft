@@ -171,59 +171,88 @@ fn set_quiet(s: &mut Session, f: impl FnOnce(&mut Document)) -> Result<()> {
     Ok(())
 }
 
-/// Run several commands as one history step labelled `label`. On failure the document goes back
-/// as it was and the journal forgets the commands `f` ran, so an action being recorded does not
-/// replay an edit that was taken back.
-pub(crate) fn compound<R>(s: &mut Session, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
-    let st = s.active().ok_or(EngineError::NoDocument)?;
-    let (before, history, prior) = (st.doc.clone(), st.history.clone(), st.layer_target());
-    // An inner command may select a layer that disappears when the compound rolls back.
-    // Selection, channel targeting and coalescing must roll back with the document (#4975).
-    let anchor = st.layer_anchor;
-    let channel_view = st.channel_view.clone();
-    let coalesce = st.coalesce.clone();
-    let was_clean = !st.is_dirty();
-    let journal = s.journal.len();
-    // Color Sampler points are view state a step may move (crop, rotation): roll them back too, so
-    // a failed second step can't leave them pinned to pixels the restored document no longer has.
-    let samplers = st.color_samplers.clone();
-    let r = f(s);
-    if r.is_err() {
-        s.journal.truncate(journal);
+/// Everything a run of several commands must put back if one of them fails: the document, its history,
+/// the targeted layers, and the view state a step may move (see [`Session::group_begin`]).
+pub struct GroupMark {
+    before: Arc<Document>,
+    history: photocraft_ops::History,
+    prior: photocraft_ops::LayerTarget,
+    anchor: Option<photocraft_doc::LayerId>,
+    channel_view: crate::channel_cmds::ChannelView,
+    coalesce: Option<String>,
+    was_clean: bool,
+    journal: usize,
+    samplers: Vec<[f64; 2]>,
+}
+
+impl Session {
+    /// Open a group on the active document: the commands run after this are ONE history step (and none of
+    /// them if the group is rolled back) once [`Session::group_end`] closes it. The group is not nested:
+    /// the caller runs the commands in between and closes it exactly once.
+    pub fn group_begin(&self) -> Result<GroupMark> {
+        let st = self.active().ok_or(EngineError::NoDocument)?;
+        Ok(GroupMark {
+            before: st.doc.clone(),
+            history: st.history.clone(),
+            prior: st.layer_target(),
+            // An inner command may select a layer that disappears when the group rolls back.
+            // Selection, channel targeting and coalescing must roll back with the document (#4975).
+            anchor: st.layer_anchor,
+            channel_view: st.channel_view.clone(),
+            coalesce: st.coalesce.clone(),
+            was_clean: !st.is_dirty(),
+            journal: self.journal.len(),
+            // Color Sampler points are view state a step may move (crop, rotation): roll them back too, so
+            // a failed second step can't leave them pinned to pixels the restored document no longer has.
+            samplers: st.color_samplers.clone(),
+        })
     }
-    let st = s.active_mut().ok_or(EngineError::NoDocument)?;
-    st.history = history;
-    let result = match r {
-        Ok(v) => {
+
+    /// Close the group opened by [`Session::group_begin`]: with `keep`, everything since is ONE history step
+    /// labelled `label`; without it, the document goes back as it was and the journal forgets the commands
+    /// the group ran, so an action being recorded does not replay an edit that was taken back.
+    pub fn group_end(&mut self, mark: GroupMark, label: &str, keep: bool) -> Result<()> {
+        let GroupMark { before, history, prior, anchor, channel_view, coalesce, was_clean, journal, samplers } = mark;
+        if !keep {
+            self.journal.truncate(journal);
+        }
+        let st = self.active_mut().ok_or(EngineError::NoDocument)?;
+        st.history = history;
+        if keep {
             // As in `Session::edit`: undo targets what was selected just before the step (#1356).
             st.history.set_current_layers(prior);
             st.history.record(label, before, st.layer_target());
             st.trim_history();
             st.coalesce = None;
-            Ok(v)
+            return Ok(());
         }
-        Err(e) => {
-            st.doc = before;
-            st.active_layer = prior.active;
-            st.selected_layers = prior.selected;
-            st.layer_anchor = anchor;
-            st.channel_view = channel_view;
-            st.coalesce = coalesce;
-            st.color_samplers = samplers;
-            st.revision += 1;
-            // A failed compound does not make an otherwise untouched document dirty.
-            if was_clean {
-                st.saved_revision = st.revision;
-            }
-            st.last_damage = None;
-            Err(e)
+        st.doc = before;
+        st.active_layer = prior.active;
+        st.selected_layers = prior.selected;
+        st.layer_anchor = anchor;
+        st.channel_view = channel_view;
+        st.coalesce = coalesce;
+        st.color_samplers = samplers;
+        st.revision += 1;
+        // A failed group does not make an otherwise untouched document dirty.
+        if was_clean {
+            st.saved_revision = st.revision;
         }
-    };
-    if result.is_err() {
+        st.last_damage = None;
         // The app-wide tool colours/mask mode follow the restored channel target.
-        s.sync_tools_mask_target();
+        self.sync_tools_mask_target();
+        Ok(())
     }
-    result
+}
+
+/// Run several commands as one history step labelled `label`. On failure the document goes back
+/// as it was and the journal forgets the commands `f` ran, so an action being recorded does not
+/// replay an edit that was taken back.
+pub(crate) fn compound<R>(s: &mut Session, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+    let mark = s.group_begin()?;
+    let r = f(s);
+    s.group_end(mark, label, r.is_ok())?;
+    r
 }
 
 /// Current time as ISO 8601 UTC (`2026-10-01T12:34:56Z`); empty on the web (no clock).

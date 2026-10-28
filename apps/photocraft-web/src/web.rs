@@ -14,6 +14,8 @@ use photocraft_ui_egui::theme::ThemeKind;
 use photocraft_ui_egui::{FileDialogAnswer, FileDialogRequest, PhotocraftApp, Services};
 use wasm_bindgen::JsCast as _;
 
+use crate::host;
+
 type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// Everything File › Open reads: PhotoCraft, Photoshop, OpenRaster, Krita and Affinity documents, flat images, and
@@ -75,6 +77,9 @@ pub fn start() {
             }
         };
         let pen_target = canvas.clone();
+        // Framed by OneOS (a declared parent origin): the host opens the image, takes every save and drives the assistant's runs.
+        let bridge = host::Bridge::new();
+        let failed_bridge = bridge.clone();
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -88,7 +93,8 @@ pub fn start() {
                     let (session, warnings) = crate::preset_bridge::session(presets.clone());
                     preset_warnings.extend(warnings);
                     let drag = listen_drag(&pen_target);
-                    let mut app = PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag)));
+                    let mut app =
+                        PhotocraftApp::new(session, services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag), bridge.as_ref()));
                     if !preset_warnings.is_empty() {
                         photocraft_ui_egui::notices::post(&mut app, i18n::t("Some brush presets could not be loaded"), preset_warnings, true, None);
                     }
@@ -102,14 +108,23 @@ pub fn start() {
                     }
                     let unsaved = Arc::new(AtomicBool::new(false));
                     guard_unload(unsaved.clone());
-                    Ok(Box::new(WebShell { app, inbox, place_inbox, unsaved, served, database, presets }))
+                    let host = bridge.map(|bridge| {
+                        app.host_framed = true;
+                        HostShell::start(bridge, cc.egui_ctx.clone())
+                    });
+                    Ok(Box::new(WebShell { app, inbox, place_inbox, unsaved, served, database, presets, host }))
                 }),
             )
             .await;
         if let Some(el) = document.get_element_by_id("photocraft_loading") {
             match result {
                 Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>PhotoCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+                Err(e) => {
+                    if let Some(bridge) = &failed_bridge {
+                        bridge.post_failed(&format!("{e:?}"));
+                    }
+                    el.set_inner_html(&format!("<p>Photo failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>"));
+                }
             }
         }
     });
@@ -269,6 +284,79 @@ struct WebShell {
     served: Served,
     database: Option<web_sys::IdbDatabase>,
     presets: crate::preset_bridge::Bridge,
+    /// The OneOS host bridge, when the page is framed by it.
+    host: Option<HostShell>,
+}
+
+/// The page's half of the OneOS bridge: what the host sent that the next frame acts on, and the hand-over of the progressive open.
+struct HostShell {
+    bridge: host::Bridge,
+    inbox: host::HostInbox,
+    notices: host::HostNotices,
+    runs: host::HostRuns,
+    handoff: crate::handoff::Handoff<Option<u64>>,
+    dirty: Box<dyn FnMut(bool)>,
+}
+
+impl HostShell {
+    /// Listen to the host and tell it the editor is ready for its file.
+    fn start(bridge: host::Bridge, ctx: egui::Context) -> Self {
+        let (inbox, notices, runs) = (host::HostInbox::default(), host::HostNotices::default(), host::HostRuns::default());
+        bridge.listen(inbox.clone(), notices.clone(), runs.clone(), ctx);
+        bridge.post_ready();
+        let dirty = bridge.dirty_fn();
+        Self { bridge, inbox, notices, runs, handoff: crate::handoff::Handoff::new(), dirty }
+    }
+
+    /// Before the app's own pass: open what the host sent, show what it refused, and note a new open for the hand-over.
+    fn before(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
+        let files: Vec<(String, Vec<u8>)> = self.inbox.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        self.handoff.before(&self.bridge, app.shown_document());
+        for (name, bytes) in files {
+            if let Err(e) = app.open_host_file(&name, &bytes) {
+                let title = format!("Couldn't open {name}");
+                photocraft_ui_egui::notices::post(app, title, vec![e], true, None);
+            }
+        }
+        let notices: Vec<String> = self.notices.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        for message in notices {
+            photocraft_ui_egui::notices::post(app, message, Vec::new(), true, None);
+        }
+        let runs: Vec<host::HostRun> = self.runs.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        for run in runs {
+            let outcome = if run.method == "command.batch" {
+                app.run_command_batch(ctx, &run.params)
+            } else {
+                Err(format!("unknown-method: this editor does not take `{}`", run.method))
+            };
+            self.bridge.answer(&run.id, outcome);
+        }
+    }
+
+    /// After the app's own pass: the hand-over (`craft:opened`, the first view's place, `craft:viewed`) and the unsaved flag.
+    fn after(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
+        let shown = app.shown_document();
+        let ppp = ctx.pixels_per_point();
+        let wanted = self.handoff.after(&self.bridge, shown, |view| {
+            if view.scrolled() {
+                app.open_at_first_view(
+                    photocraft_ui_egui::host_commands::FirstViewPlace {
+                        scroll_left: view.scroll_left,
+                        scroll_top: view.scroll_top,
+                        scroll_width: view.scroll_width,
+                        scroll_height: view.scroll_height,
+                        client_width: view.client_width,
+                        client_height: view.client_height,
+                    },
+                    ppp,
+                );
+            }
+        });
+        (self.dirty)(app.host_dirty());
+        if wanted {
+            ctx.request_repaint();
+        }
+    }
 }
 
 impl WebShell {
@@ -356,7 +444,13 @@ impl eframe::App for WebShell {
             });
         }
         self.serve_fonts(ctx);
+        if let Some(host) = self.host.as_mut() {
+            host.before(&mut self.app, ctx);
+        }
         self.app.logic(ctx, frame);
+        if let Some(host) = self.host.as_mut() {
+            host.after(&mut self.app, ctx);
+        }
         self.save_presets(ctx);
     }
 
@@ -389,7 +483,7 @@ impl eframe::App for WebShell {
     }
 }
 
-fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::CursorPosFn) -> Services {
+fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::CursorPosFn, host: Option<&host::Bridge>) -> Services {
     Services {
         screen_pick: screen_color_service(),
         import: Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
@@ -434,9 +528,13 @@ fn services(inbox: Inbox, place_inbox: Inbox, cursor_pos: photocraft_ui_egui::Cu
                 reply.send(Some(FileDialogAnswer::SaveTo(name)));
             }
         })),
-        write: Some(Box::new(|path: &str, bytes: &[u8]| download(path, bytes))),
-        // A download may be cancelled and never reports back: it doesn't save the document.
-        write_unconfirmed: true,
+        // Framed by OneOS every byte out goes to the host (a new version of the opened file, or a copy under another name); alone, a download.
+        write: Some(match host {
+            Some(bridge) => bridge.save_fn(),
+            None => Box::new(|path: &str, bytes: &[u8]| download(path, bytes)),
+        }),
+        // A download may be cancelled and never reports back: it doesn't save the document. The host answers a refused save by name.
+        write_unconfirmed: host.is_none(),
         encode_png: Some(Box::new(|w, h, rgba| {
             let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;
             photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
@@ -484,7 +582,7 @@ fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn mime_for(name: &str) -> &'static str {
+pub(crate) fn mime_for(name: &str) -> &'static str {
     match name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",

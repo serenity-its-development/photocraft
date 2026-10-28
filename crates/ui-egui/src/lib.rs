@@ -99,6 +99,7 @@ pub mod field_tab;
 pub mod field_wheel;
 pub mod file_dialog;
 pub mod file_open;
+pub mod host_commands;
 pub mod file_ui;
 pub mod fill_ui;
 pub mod filter_dialog;
@@ -999,6 +1000,9 @@ pub struct PhotocraftApp {
     pub(crate) held_opens: std::collections::VecDeque<open_prompt::Held>,
     /// Set once the user has agreed to quit, so the resulting close request goes through.
     pub(crate) allow_close: bool,
+    /// The editor is framed by the OneOS host (the web build with a declared parent): a file the host opened is saved back to
+    /// the host as a new version of that file, flattened when its format holds a single image (see `host_commands`).
+    pub host_framed: bool,
     /// Pen pressure/tilt from the platform (see `stylus`).
     pub stylus: stylus::Stylus,
     control_click: control_click::ControlClick,
@@ -1166,6 +1170,7 @@ impl PhotocraftApp {
             dds_options: None,
             held_opens: Default::default(),
             allow_close: false,
+            host_framed: false,
             stylus: Default::default(),
             control_click: Default::default(),
             background_jobs: false,
@@ -1733,6 +1738,13 @@ impl PhotocraftApp {
         if let Some(path) = path {
             return self.save_to(path, choices);
         }
+        // Framed by OneOS: Save writes the file the host opened, as its next version, with no dialog (the file's own quality and
+        // format: the way it was opened). Save As still asks (and the host makes a copy).
+        if self.host_framed
+            && let Some(own) = self.session.active().and_then(|st| st.path.clone())
+        {
+            return self.save_in_place(own, choices);
+        }
         let st = self.session.active().ok_or("no document")?;
         // PDN imports default to our native format, which preserves Paint.NET's blend modes;
         // Krita imports to OpenRaster, which Krita opens with its layers.
@@ -1782,6 +1794,12 @@ impl PhotocraftApp {
 
     /// [`Self::save_as_with`] once the path is known.
     pub(crate) fn save_to(&mut self, path: String, choices: FormatChoices) -> Result<Value, String> {
+        // The host's own file keeps the quality and format it was opened with: no JPEG Options.
+        let choices = if self.is_host_file(&path) && choices.jpeg.is_none() {
+            FormatChoices { jpeg: Some(jpeg_options_ui::JpegChoice { quality: None, format: photocraft_codecs::JpegFormat::default() }), ..choices }
+        } else {
+            choices
+        };
         // An RGB Targa asks for its bits per pixel, a DDS texture for its compression, and a JPEG
         // for its quality and format, unless the caller chose them; the save continues from the
         // prompt (still a copy when it would be one without the prompt), which records the step
@@ -1905,6 +1923,11 @@ impl PhotocraftApp {
         self.save_as_step(path.to_string(), params.get("tiffLayers").and_then(Value::as_bool), choices)
     }
 
+    /// Whether `path` is the file the OneOS host opened in the active document (the document's own path while framed).
+    pub(crate) fn is_host_file(&self, path: &str) -> bool {
+        self.host_framed && self.session.active().and_then(|st| st.path.as_deref()) == Some(path)
+    }
+
     /// What a save writes by default under the preferences: File Handling › Image Previews
     /// decides whether a PSD/PSB gets its thumbnail, and Maximize PSD and PSB File Compatibility
     /// whether it gets its real merged image. Ask When Saving has no dialog here yet, so it saves
@@ -1936,6 +1959,10 @@ impl PhotocraftApp {
         // An OpenRaster file that can't hold everything (adjustment layers, styles…) is a copy too,
         // so the editable document isn't marked saved after losing them (#3806).
         let st = self.session.active().ok_or("no document")?;
+        // The host's own file is always saved back to the host as its next version (flattened when its format holds one image).
+        if self.is_host_file(path) {
+            return Ok(false);
+        }
         let tiff = |p: &str| matches!(photocraft_engine::file_cmds::extension(p).as_deref(), Some("tif" | "tiff"));
         let holds = photocraft_engine::file_cmds::holds_at(&st.doc, path) || tiff(path);
         let lives_layered = st.path.as_deref().is_some_and(|p| photocraft_engine::file_cmds::saves_in_place(p) || tiff(p));
