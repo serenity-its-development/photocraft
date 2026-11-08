@@ -1045,7 +1045,7 @@ pub const LEFT_OUT: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Interactive: it begins a pointer gesture, a dialog or a text-editing session that only a person's pointer can finish (use the command that takes its numbers: edit.transform, select.rect, type.create ...).",
+        "Interactive: it begins a pointer gesture, a dialog or a text-editing session that only a person's pointer can finish (use the command that takes its numbers: edit.transform, select.rect, type.create and the like).",
         &[
             "edit.transform.again", "edit.transform.againCopy", "edit.transform.splitWarpCrosswise", "edit.transform.splitWarpHorizontally",
             "edit.transform.splitWarpVertically", "edit.transform.removeWarpSplit", "edit.transform.warpGrid", "ui.symmetryTransform",
