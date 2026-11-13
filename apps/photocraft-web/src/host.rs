@@ -6,8 +6,11 @@
 //!
 //! - `craft:ready {app, version}` (to the parent): listening; send the file now.
 //! - `craft:open {session, name, mime, bytes, versionId, readOnly, collab}` (from the parent): open these bytes.
-//! - `craft:export {session, request}` (from the parent): the host asks for the image's bytes as they stand; answered by
-//!   `craft:save {…, checkpoint: request}` (`export.rs`). Never a save of the person's: nothing is committed or marked saved.
+//! - `craft:export {session, request, keep?}` (from the parent): the host asks for the image's bytes as they stand; answered by
+//!   `craft:save {…, checkpoint: request, losses}` (`export.rs`). Never a save of the person's: nothing is committed or marked saved.
+//!   The answer is the host's file when its format loses nothing, else the native `.pcraft` file with what the host's format would
+//!   lose (`losses`; the host keeps it beside the original, oneos files/044). `keep: "original"`: the person chose the host's own
+//!   format and accepted the loss - that format, with the losses named.
 //! - `craft:save {session, name, mime, bytes, baseVersionId, saveAs}` (to the parent): the person saved; the bytes are a
 //!   transferred `ArrayBuffer`. The host makes a NEW version of the file through the compare-and-set and answers
 //!   `craft:saved {session, versionId}` (the next save's base) or `craft:refused {session, code, reason}`.
@@ -64,7 +67,7 @@ pub struct Bridge {
     version: String,
     opened: Rc<RefCell<Opened>>,
     /// The host's asks for the image's bytes (`craft:export`), judged when heard and answered on the next frame.
-    exports: Rc<RefCell<Vec<u64>>>,
+    exports: Rc<RefCell<Vec<(u64, bool)>>>,
 }
 
 /// `scheme://host[:port]` exactly: https, or http only on localhost (the dev estate).
@@ -193,7 +196,7 @@ impl Bridge {
                         crate::export::judge(&opened.session, opened.read_only, &asked, request)
                     };
                     match judged {
-                        Ok(request) => bridge.exports.borrow_mut().push(request),
+                        Ok(request) => bridge.exports.borrow_mut().push((request, string(&data, "keep").as_deref() == Some("original"))),
                         Err(why) => log::warn!("Photo: an export ask was not taken: {why:?}"),
                     }
                 }
@@ -232,7 +235,7 @@ impl Bridge {
     }
 
     /// The export asks heard since the last frame.
-    pub fn take_exports(&self) -> Vec<u64> {
+    pub fn take_exports(&self) -> Vec<(u64, bool)> {
         std::mem::take(&mut *self.exports.borrow_mut())
     }
 
@@ -242,20 +245,25 @@ impl Bridge {
     }
 
     /// `craft:save {…, checkpoint: request}` to the parent: the answer to its `craft:export`. Never a save of the person's.
-    pub fn post_export(&self, bytes: &[u8], request: u64) -> Result<(), String> {
-        let (session, name, base) = {
+    pub fn post_export(&self, name: &str, bytes: &[u8], request: u64, losses: &[String]) -> Result<(), String> {
+        let (session, base) = {
             let opened = self.opened.borrow();
-            (opened.session.clone(), opened.name.clone(), opened.version_id.clone())
+            (opened.session.clone(), opened.version_id.clone())
         };
+        let named = js_sys::Array::new();
+        for l in losses {
+            named.push(&JsValue::from_str(l));
+        }
         let buffer = js_sys::Uint8Array::from(bytes).buffer();
         let m = message(&[
             ("type", "craft:save".into()),
             ("session", session.as_str().into()),
-            ("name", name.as_str().into()),
-            ("mime", crate::web::mime_for(&name).into()),
+            ("name", name.into()),
+            ("mime", crate::web::mime_for(name).into()),
             ("baseVersionId", base.as_str().into()),
             ("saveAs", false.into()),
             ("checkpoint", (request as f64).into()),
+            ("losses", named.into()),
             ("bytes", buffer.clone().into()),
         ])
         .ok_or_else(|| "couldn't build the message".to_string())?;

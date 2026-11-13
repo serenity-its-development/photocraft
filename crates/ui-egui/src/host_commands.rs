@@ -105,6 +105,43 @@ impl PhotocraftApp {
         export(&st.doc, name, &settings).map(|(bytes, _warnings)| bytes)
     }
 
+    /// What a plain Save of the host's file `name` would lose, as the editor knows it (oneos files/044: auto-save writes only a format
+    /// that loses nothing): more than one layer in a format that holds one image, a codec that compresses with loss, and every note
+    /// the format's writer gives of what it approximates or drops. Empty: the file holds everything this document has.
+    pub fn host_save_losses(&self, name: &str) -> Result<Vec<String>, String> {
+        let st = self.session.documents().iter().find(|st| st.path.as_deref() == Some(name)).ok_or_else(|| format!("no open document is {name}"))?;
+        let ext = name.rsplit('.').next().map(str::to_ascii_lowercase).unwrap_or_default();
+        let settings = crate::FormatChoices::default().apply(self.save_settings_of(Some(st)));
+        let mut losses = Vec::new();
+        if matches!(ext.as_str(), "png" | "bmp" | "jpg" | "jpeg" | "webp" | "gif") && st.doc.layer_count() > 1 {
+            losses.push(format!("layers ({} of them; .{ext} holds one flattened image)", st.doc.layer_count()));
+        }
+        if matches!(ext.as_str(), "jpg" | "jpeg") || (ext == "webp" && !settings.webp_lossless) {
+            losses.push(format!("the exact pixels (.{ext} compresses with loss)"));
+        }
+        let export = self.services.export.as_ref().ok_or("no exporter configured")?;
+        let (_, warnings) = export(&st.doc, name, &settings)?;
+        losses.extend(warnings);
+        Ok(losses)
+    }
+
+    /// The host's ask for an export, answered as `(name, bytes, losses)`: the host's file in its own format when that loses nothing,
+    /// else the native file (`<stem>.pcraft`, every layer and blend mode kept) with what the host's format would lose, which the host
+    /// keeps as a NEW file beside the original (oneos files/044). `keep_original`: the person chose the older format and accepted the
+    /// loss - the host's own format, with the losses named.
+    pub fn host_export(&self, name: &str, keep_original: bool) -> Result<(String, Vec<u8>, Vec<String>), String> {
+        let losses = self.host_save_losses(name)?;
+        if keep_original || losses.is_empty() {
+            return self.host_export_bytes(name).map(|bytes| (name.to_string(), bytes, losses));
+        }
+        let st = self.session.documents().iter().find(|st| st.path.as_deref() == Some(name)).ok_or_else(|| format!("no open document is {name}"))?;
+        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+        let native = format!("{stem}.{}", photocraft_format::EXTENSION);
+        let settings = crate::FormatChoices::default().apply(self.save_settings_of(Some(st)));
+        let export = self.services.export.as_ref().ok_or("no exporter configured")?;
+        export(&st.doc, &native, &settings).map(|(bytes, _)| (native, bytes, losses))
+    }
+
     /// Whether any document has changes the host does not hold yet.
     pub fn host_dirty(&self) -> bool {
         self.session.documents().iter().any(|d| d.is_dirty())
@@ -288,6 +325,50 @@ mod tests {
         app.save_as(None).unwrap();
         assert_eq!(written.borrow().as_slice(), &[("pic.png".to_string(), first)]);
         assert!(!app.host_dirty());
+    }
+
+    /// oneos files/044: auto-save writes only a format that loses nothing. A one-layer PNG saves as itself; a second layer, or a
+    /// JPEG's lossy codec, sends the native `.pcraft` file (every layer kept) with what the host's format would lose, by name; the
+    /// person's own choice of the older format (`keep_original`) answers that format with the same losses named.
+    #[test]
+    fn an_export_is_the_lossless_format_and_names_what_the_hosts_format_would_lose() {
+        let services = || crate::Services {
+            import: Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
+                photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+            })),
+            export: Some(Box::new(|doc: &photocraft_doc::Document, path: &str, settings: &crate::ExportSettings| {
+                photocraft_io::export(doc, path, &settings.io_options()).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
+            })),
+            ..Default::default()
+        };
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 24, "height": 24, "background": "white"})).unwrap();
+        let png = s.export_active("pic.png").unwrap();
+        let jpg = s.export_active("pic.jpg").unwrap();
+
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services());
+        app.open_host_file("pic.png", &png).unwrap();
+        let (name, bytes, losses) = app.host_export("pic.png", false).unwrap();
+        assert_eq!((name.as_str(), losses.len()), ("pic.png", 0), "one layer in a PNG loses nothing: it saves as itself ({losses:?})");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+
+        app.run_command_batch(&egui::Context::default(), &json!({"steps": [{"name": "layer.new.layer", "args": {"name": "Ink"}}]})).unwrap();
+        let (name, native, losses) = app.host_export("pic.png", false).unwrap();
+        assert_eq!(name, "pic.pcraft", "a second layer: the native file, beside the original");
+        assert!(losses.iter().any(|l| l.starts_with("layers (2 of them")), "{losses:?}");
+        let mut back = PhotocraftApp::new(photocraft_engine::Session::new(), services());
+        back.open_host_file("pic.pcraft", &native).unwrap();
+        assert_eq!(back.session.active().unwrap().doc.layer_count(), 2, "the native file keeps both layers");
+        let (name, older, named) = app.host_export("pic.png", true).unwrap();
+        assert_eq!((name.as_str(), &older[..8]), ("pic.png", &b"\x89PNG\r\n\x1a\n"[..]), "the person's choice: the older format");
+        assert_eq!(named, losses, "with the same losses named");
+        assert!(app.host_dirty(), "an export is not a save");
+
+        let mut photo = PhotocraftApp::new(photocraft_engine::Session::new(), services());
+        photo.open_host_file("pic.jpg", &jpg).unwrap();
+        let (name, _, losses) = photo.host_export("pic.jpg", false).unwrap();
+        assert_eq!(name, "pic.pcraft", "a JPEG re-encodes with loss: never auto-saved over itself");
+        assert!(losses.iter().any(|l| l.contains("compresses with loss")), "{losses:?}");
     }
 
     #[test]
