@@ -1935,11 +1935,16 @@ impl PhotocraftApp {
     /// document's file was (its JPEG quality, a WebP lossy at its quality or lossless), as
     /// Photoshop's Save and Save As options start there.
     pub(crate) fn save_settings(&self) -> ExportSettings {
+        self.save_settings_of(self.session.active())
+    }
+
+    /// [`Self::save_settings`] for the document `st`, active or not (`None`: the preferences alone).
+    pub(crate) fn save_settings_of(&self, st: Option<&photocraft_engine::DocState>) -> ExportSettings {
         let file_handling = &self.session.prefs().file_handling;
         let previews = file_handling.image_previews != photocraft_engine::prefs::Ask::Never;
         let maximize = file_handling.maximize_psd_compatibility != photocraft_engine::prefs::Ask::Never;
         let mut settings = ExportSettings { image_previews: previews, psd_maximize_compatibility: maximize, ..ExportSettings::default() };
-        if let Some(st) = self.session.active() {
+        if let Some(st) = st {
             let e = &st.doc.file_encoding;
             settings.jpeg_quality = e.jpeg_quality.map(|q| q.clamp(1, 100));
             settings.webp_lossless = e.webp_lossless.unwrap_or(settings.webp_lossless);

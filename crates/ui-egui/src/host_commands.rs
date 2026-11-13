@@ -93,6 +93,18 @@ impl PhotocraftApp {
         self.session.active().map(|st| st.doc.id.0)
     }
 
+    /// The bytes File › Save would write for the host's file `name`, as its document stands: the answer to the host's ask for an
+    /// export (auto-save, save on close). Nothing here is a save: the document is only read (`&self`), so no text being typed and
+    /// no tool is committed, the document keeps its layers (a format that holds one image gets a flattened COPY of it), its
+    /// unsaved state and its history, and nothing is shown or journaled. The settings are those of a plain Save of the host's file
+    /// (`save_in_place` with no answers: the JPEG quality or WebP mode the file was opened with, no dialog).
+    pub fn host_export_bytes(&self, name: &str) -> Result<Vec<u8>, String> {
+        let st = self.session.documents().iter().find(|st| st.path.as_deref() == Some(name)).ok_or_else(|| format!("no open document is {name}"))?;
+        let settings = crate::FormatChoices::default().apply(self.save_settings_of(Some(st)));
+        let export = self.services.export.as_ref().ok_or("no exporter configured")?;
+        export(&st.doc, name, &settings).map(|(bytes, _warnings)| bytes)
+    }
+
     /// Whether any document has changes the host does not hold yet.
     pub fn host_dirty(&self) -> bool {
         self.session.documents().iter().any(|d| d.is_dirty())
@@ -221,6 +233,61 @@ mod tests {
         assert_eq!(&writes[0].1[..8], b"\x89PNG\r\n\x1a\n");
         drop(writes);
         assert!(!app.host_dirty(), "saved: the host holds it");
+    }
+
+    /// The host's ask for the bytes (`craft:export`) is never a save: the bytes are what Save would write, and the document is as
+    /// it was (unsaved, same revision, same layers, same history, nothing written, journaled or shown).
+    #[test]
+    fn an_export_for_the_host_is_the_bytes_of_a_save_and_leaves_the_document_unsaved_and_unchanged() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let written: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::default();
+        let sink = written.clone();
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 24, "height": 24, "background": "white"})).unwrap();
+        let png = s.export_active("pic.png").unwrap();
+        let services = crate::Services {
+            import: Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
+                photocraft_io::import_with_options(name, bytes, opts).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string())
+            })),
+            export: Some(Box::new(|doc: &photocraft_doc::Document, path: &str, settings: &crate::ExportSettings| {
+                photocraft_io::export(doc, path, &settings.io_options()).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
+            })),
+            write: Some(Box::new(move |path: &str, bytes: &[u8]| {
+                sink.borrow_mut().push((path.to_string(), bytes.to_vec()));
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+        assert!(app.host_export_bytes("pic.png").is_err(), "nothing is open yet");
+        app.open_host_file("pic.png", &png).unwrap();
+        app.run_command_batch(&egui::Context::default(), &json!({"steps": [{"name": "layer.new.layer", "args": {"name": "Ink"}}]})).unwrap();
+        assert!(app.host_dirty());
+        assert!(app.host_export_bytes("other.png").is_err(), "only the host's own file is exported");
+
+        let before = {
+            let st = app.session.active().unwrap();
+            (st.doc.clone(), st.revision, st.saved_revision, st.path.clone(), (st.history.entries(), st.history.can_redo()))
+        };
+        let (journal, status, notices) = (app.session.journal.len(), app.ui.status.clone(), app.ui.notices.len());
+        let first = app.host_export_bytes("pic.png").unwrap();
+        let second = app.host_export_bytes("pic.png").unwrap();
+        assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n", "the host's file's own format");
+        assert_eq!(first, second, "asked twice, the same bytes");
+
+        let st = app.session.active().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&st.doc, &before.0), "the very same document: nothing was flattened into it");
+        assert_eq!((st.revision, st.saved_revision, st.path.clone()), (before.1, before.2, before.3));
+        assert_eq!((st.history.entries(), st.history.can_redo()), before.4, "no step was added to the history");
+        assert!(app.host_dirty(), "an export is not a save: the work is still unsaved");
+        assert_eq!((app.session.journal.len(), app.ui.status.clone(), app.ui.notices.len()), (journal, status, notices));
+        assert!(written.borrow().is_empty(), "nothing went through the writer");
+
+        // The person's Save of the same document writes exactly those bytes.
+        app.save_as(None).unwrap();
+        assert_eq!(written.borrow().as_slice(), &[("pic.png".to_string(), first)]);
+        assert!(!app.host_dirty());
     }
 
     #[test]

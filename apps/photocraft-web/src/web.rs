@@ -352,6 +352,18 @@ impl HostShell {
                 );
             }
         });
+        // The host's asks for the bytes: the image as it stands, with nothing committed, flattened into it or marked saved.
+        for request in self.bridge.take_exports() {
+            let name = self.bridge.opened_name();
+            match app.host_export_bytes(&name) {
+                Ok(bytes) => {
+                    if let Err(e) = self.bridge.post_export(&bytes, request) {
+                        log::warn!("Photo: the export could not be handed to the host: {e}");
+                    }
+                }
+                Err(e) => log::warn!("Photo: {name} could not be exported: {e}"),
+            }
+        }
         (self.dirty)(app.host_dirty());
         if wanted {
             ctx.request_repaint();
